@@ -1,19 +1,20 @@
-use reqwest::StatusCode;
-use sqlx::PgPool;
-use axum::{routing::get, Router};
-use chrono::{naive::NaiveDate, Local};
+use chrono::Days;
+use chrono::Local;
 use reqwest::Client;
+use reqwest::StatusCode;
 use scraper::{Html, Selector};
+use sqlx::PgPool;
 use std::net::SocketAddr;
 use std::thread::sleep as StdSleep;
 use std::time::Duration as StdDuration;
 use tokio::time::{sleep as TokioSleep, Duration as TokioDuration};
-use tracing::{error, debug};
-use chrono::Days;
+use tracing::{debug, error};
+
+const USER_AGENT: &str = "Mozilla/5.0 (iPad; CPU OS 12_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148";
 
 pub struct CustomService {
     ctx: Client,
-	db: PgPool,
+    db: PgPool,
 }
 
 #[derive(Clone, Debug)]
@@ -26,11 +27,11 @@ pub struct Product {
 
 #[shuttle_runtime::main]
 async fn axum(
-	#[shuttle_shared_db::Postgres] db: PgPool,
+    #[shuttle_shared_db::Postgres] db: PgPool,
 ) -> Result<CustomService, shuttle_runtime::Error> {
-	sqlx::migrate!().run(&db).await.unwrap();
+    sqlx::migrate!().run(&db).await.unwrap();
 
-    let ctx = Client::new();
+    let ctx = Client::builder().user_agent(USER_AGENT).build().unwrap();
     Ok(CustomService { ctx, db })
 }
 
@@ -44,10 +45,11 @@ impl shuttle_runtime::Service for CustomService {
 }
 
 pub async fn scrape(ctx: Client, db: PgPool) -> Result<(), String> {
-	debug!("Starting scraper...");
+    debug!("Starting scraper...");
     loop {
         let mut vec: Vec<Product> = Vec::new();
         let mut pagenum = 1;
+        let mut retry_attempts = 0;
         loop {
             let url = format!("https://www.amazon.com/s?k=raspberry+pi&page={pagenum}");
 
@@ -55,29 +57,37 @@ pub async fn scrape(ctx: Client, db: PgPool) -> Result<(), String> {
                 Ok(res) => res,
                 Err(e) => {
                     error!("Something went wrong while fetching from url: {e}");
-            		StdSleep(StdDuration::from_secs(10));
-			continue
-	}
-		};
-
-		if res.status() == StatusCode::SERVICE_UNAVAILABLE {
-			error!("Amazon returned a 503 at page {pagenum}");
-            		StdSleep(StdDuration::from_secs(10));
-			continue
-		}
-
-	    let body = match res.text().await {
-		Ok(res) => res,
-		Err(e) => {
-			error!("Something went wrong while turning data to text: {e}");
-                    StdSleep(StdDuration::from_secs(10));
-                    continue
+                    StdSleep(StdDuration::from_secs(15));
+                    continue;
                 }
             };
-		
-		debug!("Page {pagenum} was scraped");
+
+            if res.status() == StatusCode::SERVICE_UNAVAILABLE {
+                error!("Amazon returned a 503 at page {pagenum}");
+                retry_attempts += 1;
+                if retry_attempts >= 10 {
+                    error!("It looks like Amazon is blocking us! We will rest for an hour.");
+                    StdSleep(StdDuration::from_secs(3600));
+                    continue;
+                } else {
+                    StdSleep(StdDuration::from_secs(15));
+                    continue;
+                }
+            }
+
+            let body = match res.text().await {
+                Ok(res) => res,
+                Err(e) => {
+                    error!("Something went wrong while turning data to text: {e}");
+                    StdSleep(StdDuration::from_secs(15));
+                    continue;
+                }
+            };
+
+            debug!("Page {pagenum} was scraped");
             let html = Html::parse_fragment(&body);
-            let selector = Selector::parse("div[data-component-type= ' s-search-result ' ]").unwrap();
+            let selector =
+                Selector::parse("div[data-component-type= ' s-search-result ' ]").unwrap();
 
             if html.select(&selector).count() == 0 {
                 break;
@@ -108,58 +118,58 @@ pub async fn scrape(ctx: Client, db: PgPool) -> Result<(), String> {
                         .map(|link| {
                             format!("https://amazon.co.uk{}", link.value().attr("href").unwrap())
                         })
-                        .collect::<String>()
+                        .collect::<String>(),
                 });
             }
             pagenum += 1;
+            retry_attempts = 0;
             StdSleep(StdDuration::from_secs(15));
         }
-    
 
-    let transaction = db.begin().await.unwrap();
+        let transaction = db.begin().await.unwrap();
 
-    for product in vec {
-        if let Err(e) = sqlx::query(
-            "INSERT INTO 
+        for product in vec {
+            if let Err(e) = sqlx::query(
+                "INSERT INTO 
         products
        (name, price, old_price, link, scraped_at)
        VALUES
        ($1, $2, $3, $4, $5)
       ",
-        )
-        .bind(product.name)
-        .bind(product.price)
-        .bind(product.old_price)
-        .bind(product.link)
-        .execute(&db)
-        .await
-        {
-            error!("There was an error: {e}");
-            error!("This web scraper will now shut down.");
-            break;
+            )
+            .bind(product.name)
+            .bind(product.price)
+            .bind(product.old_price)
+            .bind(product.link)
+            .execute(&db)
+            .await
+            {
+                error!("There was an error: {e}");
+                error!("This web scraper will now shut down.");
+                break;
+            }
         }
+        transaction.commit().await.unwrap();
+
+        // get the local time, add a day then get the NaiveDate and set a time of 00:00 to it
+        let tomorrow_midnight = Local::now()
+            .checked_add_days(Days::new(1))
+            .unwrap()
+            .date_naive()
+            .and_hms_opt(0, 0, 0)
+            .unwrap();
+
+        // get the local time now
+        let now = Local::now().naive_local();
+
+        // check the amount of time between now and midnight tomorrow
+        let duration_to_midnight = tomorrow_midnight
+            .signed_duration_since(now)
+            .to_std()
+            .unwrap();
+
+        // sleep for the required time
+        TokioSleep(TokioDuration::from_secs(duration_to_midnight.as_secs())).await;
     }
-    transaction.commit().await.unwrap();
-
-    // get the local time, add a day then get the NaiveDate and set a time of 00:00 to it
-    let tomorrow_midnight = Local::now()
-        .checked_add_days(Days::new(1))
-        .unwrap()
-        .date_naive()
-        .and_hms_opt(0, 0, 0)
-        .unwrap();
-
-    // get the local time now
-    let now = Local::now().naive_local();
-
-    // check the amount of time between now and midnight tomorrow
-    let duration_to_midnight = tomorrow_midnight
-        .signed_duration_since(now)
-        .to_std()
-        .unwrap();
-
-    // StdSleep for the required time
-    TokioSleep(TokioDuration::from_secs(300).await;
-	}
-Ok(())
+    Ok(())
 }
