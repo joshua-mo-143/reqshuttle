@@ -5,12 +5,11 @@ use reqwest::StatusCode;
 use scraper::{Html, Selector};
 use sqlx::PgPool;
 use std::net::SocketAddr;
-use std::thread::sleep as StdSleep;
-use std::time::Duration as StdDuration;
-use tokio::time::{sleep as TokioSleep, Duration as TokioDuration};
+use std::thread::sleep as std_sleep;
+use tokio::time::{sleep as tokio_sleep, Duration};
 use tracing::{debug, error};
 
-const USER_AGENT: &str = "Mozilla/5.0 (iPad; CPU OS 12_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148";
+const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/117.0";
 
 pub struct CustomService {
     ctx: Client,
@@ -44,7 +43,7 @@ impl shuttle_runtime::Service for CustomService {
     }
 }
 
-pub async fn scrape(ctx: Client, db: PgPool) -> Result<(), String> {
+async fn scrape(ctx: Client, db: PgPool) -> Result<(), String> {
     debug!("Starting scraper...");
     loop {
         let mut vec: Vec<Product> = Vec::new();
@@ -57,7 +56,7 @@ pub async fn scrape(ctx: Client, db: PgPool) -> Result<(), String> {
                 Ok(res) => res,
                 Err(e) => {
                     error!("Something went wrong while fetching from url: {e}");
-                    StdSleep(StdDuration::from_secs(15));
+                    std_sleep(Duration::from_secs(15));
                     continue;
                 }
             };
@@ -67,10 +66,10 @@ pub async fn scrape(ctx: Client, db: PgPool) -> Result<(), String> {
                 retry_attempts += 1;
                 if retry_attempts >= 10 {
                     error!("It looks like Amazon is blocking us! We will rest for an hour.");
-                    StdSleep(StdDuration::from_secs(3600));
+                    std_sleep(Duration::from_secs(3600));
                     continue;
                 } else {
-                    StdSleep(StdDuration::from_secs(15));
+                    std_sleep(Duration::from_secs(15));
                     continue;
                 }
             }
@@ -79,7 +78,7 @@ pub async fn scrape(ctx: Client, db: PgPool) -> Result<(), String> {
                 Ok(res) => res,
                 Err(e) => {
                     error!("Something went wrong while turning data to text: {e}");
-                    StdSleep(StdDuration::from_secs(15));
+                    std_sleep(Duration::from_secs(15));
                     continue;
                 }
             };
@@ -123,7 +122,7 @@ pub async fn scrape(ctx: Client, db: PgPool) -> Result<(), String> {
             }
             pagenum += 1;
             retry_attempts = 0;
-            StdSleep(StdDuration::from_secs(15));
+            std_sleep(Duration::from_secs(15));
         }
 
         let transaction = db.begin().await.unwrap();
@@ -169,7 +168,7 @@ pub async fn scrape(ctx: Client, db: PgPool) -> Result<(), String> {
             .unwrap();
 
         // sleep for the required time
-        TokioSleep(TokioDuration::from_secs(duration_to_midnight.as_secs())).await;
+        tokio_sleep(Duration::from_secs(duration_to_midnight.as_secs())).await;
     }
     Ok(())
 }
